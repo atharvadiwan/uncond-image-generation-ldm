@@ -7,7 +7,10 @@ import torch.nn as nn
 from diffusers import (
     VQModel,
     UNet2DModel,
+    AutoencoderKL,
+
 )
+from unet_model_seg import UNet2DDualOutputModel
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline, ImagePipelineOutput
 from diffusers.schedulers import (
     DDIMScheduler,
@@ -25,6 +28,8 @@ from diffusers.utils.torch_utils import randn_tensor
 class LatentDiffusionPipelineBase(DiffusionPipeline):
     def decode_latents(self, latents):
         latents = latents / 0.18215
+        print(f"Latents dtype: {latents.dtype}, VAE dtype: {self.vae.dtype}")
+        latents = latents.to(dtype=self.vae.dtype)
         image = self.vae.decode(latents, return_dict=False)[0]
         image = (image / 2 + 0.5).clamp(0, 1)
         # we always cast to float32 as this does not cause significant overhead and is compatible with bfloat16
@@ -73,7 +78,7 @@ class LatentDiffusionPipelineBase(DiffusionPipeline):
 class UncondLatentDiffusionPipeline(LatentDiffusionPipelineBase):
     def __init__(
             self,
-            vae: VQModel,
+            vae: AutoencoderKL,
             scheduler: Union[
                 DDIMScheduler,
                 DDPMScheduler,
@@ -83,7 +88,7 @@ class UncondLatentDiffusionPipeline(LatentDiffusionPipelineBase):
                 LMSDiscreteScheduler,
                 PNDMScheduler,
             ],
-            unet: UNet2DModel,
+            unet: UNet2DDualOutputModel,
     ):
         super().__init__()
 
@@ -105,7 +110,7 @@ class UncondLatentDiffusionPipeline(LatentDiffusionPipelineBase):
             generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
             latents: Optional[torch.FloatTensor] = None,
             output_type: Optional[str] = "pil",
-            return_dict: bool = True,
+            return_dict: bool = False,
             eta: Optional[float] = 0.0,
             **kwargs,
     ) -> Union[Tuple, ImagePipelineOutput]:
@@ -119,7 +124,7 @@ class UncondLatentDiffusionPipeline(LatentDiffusionPipelineBase):
                 f"`height` and `width` have to be divisible by 8 but are {height} and {width}."
             )
 
-        latents = self.prepare_latents(batch_size, 3, height, width,
+        latents = self.prepare_latents(batch_size, 4, height, width,
                                        self.unet.dtype, self.device, generator, latents)
 
         self.scheduler.set_timesteps(num_inference_steps)
@@ -130,10 +135,10 @@ class UncondLatentDiffusionPipeline(LatentDiffusionPipelineBase):
         for t in self.progress_bar(self.scheduler.timesteps):
             latents = self.scheduler.scale_model_input(latents, t)
 
-            noise_pred = self.unet(
+            noise_pred, noise_seg_map = self.unet(
                 latents,
                 t,
-            ).sample
+            )
 
             # compute the previous noisy sample x_t -> x_t-1
             latents = self.scheduler.step(
@@ -146,6 +151,6 @@ class UncondLatentDiffusionPipeline(LatentDiffusionPipelineBase):
             image = self.numpy_to_pil(image)
 
         if not return_dict:
-            return (image,)
+            return (image, noise_seg_map)
 
         return ImagePipelineOutput(images=image)

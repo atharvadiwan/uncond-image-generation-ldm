@@ -5,7 +5,11 @@ import math
 import os
 import shutil
 from datetime import timedelta
+from PIL import Image
 from pathlib import Path
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+import numpy as np
 
 import accelerate
 import datasets
@@ -27,7 +31,9 @@ from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, is_accelerate_version, is_tensorboard_available, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 from src.pipeline import *
-
+from unet_model_seg import UNet2DDualOutputModel
+import glob
+from datasets import Dataset
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.27.0.dev0")
@@ -35,8 +41,17 @@ check_min_version("0.27.0.dev0")
 logger = get_logger(__name__, log_level="INFO")
 
 # Change the info of your pretrained VAE model here
-VAE_PRETRAINED_PATH = "CompVis/ldm-celebahq-256"
-VAE_KWARGS = {"subfolder":"vqvae"}
+VAE_PRETRAINED_PATH = "/workspace/data/stable_diffusion_weights/stable-diffusion-v1-5"
+VAE_KWARGS = {"subfolder":"vae"}
+
+def dice_loss(pred, target, epsilon=1e-6):
+    pred = torch.sigmoid(pred)
+    pred = pred.view(pred.size(0), -1)
+    target = target.view(target.size(0), -1)
+    intersection = (pred * target).sum(dim=1)
+    union = pred.sum(dim=1) + target.sum(dim=1)
+    dice = (2. * intersection + epsilon) / (union + epsilon)
+    return 1 - dice.mean()
 
 
 def _extract_into_tensor(arr, timesteps, broadcast_shape):
@@ -287,8 +302,8 @@ def parse_args():
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
 
-    if args.dataset_name is None and args.train_data_files is None and args.train_data_dir is None:
-        raise ValueError("You must specify either a dataset name from the hub or a train data directory.")
+    # if args.dataset_name is None and args.train_data_files is None and args.train_data_dir is None:
+    #     raise ValueError("You must specify either a dataset name from the hub or a train data directory.")
 
     return args
 
@@ -335,7 +350,7 @@ def main(args):
 
         def load_model_hook(models, input_dir):
             if args.use_ema:
-                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "unet_ema"), UNet2DModel)
+                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "unet_ema"), UNet2DDualOutputModel)
                 ema_model.load_state_dict(load_model.state_dict())
                 ema_model.to(accelerator.device)
                 del load_model
@@ -345,7 +360,7 @@ def main(args):
                 model = models.pop()
 
                 # load diffusers style into model
-                load_model = UNet2DModel.from_pretrained(input_dir, subfolder="unet")
+                load_model = UNet2DDualOutputModel.from_pretrained(input_dir, subfolder="unet")
                 model.register_to_config(**load_model.config)
 
                 model.load_state_dict(load_model.state_dict())
@@ -379,7 +394,8 @@ def main(args):
             ).repo_id
 
     # Load pretrained VAE model
-    vae = VQModel.from_pretrained(VAE_PRETRAINED_PATH, **VAE_KWARGS)
+    # vae = VQModel.from_pretrained(VAE_PRETRAINED_PATH, **VAE_KWARGS)
+    vae = AutoencoderKL.from_pretrained(VAE_PRETRAINED_PATH, **VAE_KWARGS)
 
     # Freeze the VAE model
     vae.requires_grad_(False)
@@ -388,11 +404,13 @@ def main(args):
 
     # Initialize the model
     if args.model_config_name_or_path is None:
-        model = UNet2DModel(sample_size=args.resolution // vae_scale_factor,
-                            in_channels=3, out_channels=3)
+        model = UNet2DDualOutputModel(sample_size=args.resolution // vae_scale_factor,
+                            in_channels=4, out_channels=4)
     else:
-        config = UNet2DModel.load_config(args.model_config_name_or_path)
-        model = UNet2DModel.from_config(config)
+        config = UNet2DDualOutputModel.load_config(args.model_config_name_or_path)
+        config["in_channels"] = 4
+        config["out_channels"] = 4
+        model = UNet2DDualOutputModel.from_config(config)
 
     # Create EMA for the model.
     if args.use_ema:
@@ -402,7 +420,7 @@ def main(args):
             use_ema_warmup=True,
             inv_gamma=args.ema_inv_gamma,
             power=args.ema_power,
-            model_cls=UNet2DModel,
+            model_cls=UNet2DDualOutputModel,
             model_config=model.config,
         )
 
@@ -452,34 +470,83 @@ def main(args):
 
     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
     # download the dataset.
-    if args.dataset_name is not None:
-        dataset = load_dataset(
-            args.dataset_name,
-            args.dataset_config_name,
-            cache_dir=args.cache_dir,
-            split="train",
-        )
-    elif args.train_data_files is not None:
-        dataset = load_dataset("imagefolder", data_files=args.train_data_files, split="train")
-    else:
-        dataset = load_dataset("imagefolder", data_dir=args.train_data_dir, cache_dir=args.cache_dir, split="train")
+    # if args.dataset_name is not None:
+    #     dataset = load_dataset(
+    #         args.dataset_name,
+    #         args.dataset_config_name,
+    #         cache_dir=args.cache_dir,
+    #         split="train",
+    #     )
+    # elif args.train_data_files is not None:
+    #     dataset = load_dataset("imagefolder", data_files=args.train_data_files, split="train")
+    # else:
+    #     dataset = load_dataset("imagefolder", data_dir=args.train_data_dir, cache_dir=args.cache_dir, split="train")
+
+
+    image_paths = sorted(glob.glob("/workspace/data/ASV_diffusion_data/dataset/train/images/*.png"))
+    mask_paths = [p.replace("images", "masks").replace(".png", ".npy") for p in image_paths]
+
+    dataset = Dataset.from_dict({
+        "image": image_paths,
+        "mask": mask_paths
+    })
+
+    
         # See more about loading custom images at
         # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
 
     # Preprocessing the datasets and DataLoaders creation.
-    augmentations = transforms.Compose(
-        [
-            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(args.resolution) if args.center_crop else transforms.RandomCrop(args.resolution),
-            transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(lambda x: x),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
-        ]
-    )
+    # augmentations = transforms.Compose(
+    #     [
+    #         transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+    #         transforms.CenterCrop(args.resolution) if args.center_crop else transforms.RandomCrop(args.resolution),
+    #         transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(lambda x: x),
+    #         transforms.ToTensor(),
+    #         transforms.Normalize([0.5], [0.5]),
+    #     ]
+    # )
+
+    # mask_augmentations = transforms.Compose(
+    #     [
+    #         transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.NEAREST),
+    #         transforms.CenterCrop(args.resolution) if args.center_crop else transforms.RandomCrop(args.resolution),
+    #         transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(lambda x: x),
+    #         transforms.PILToTensor(),  # Keeps mask as integer tensor
+    #         transforms.Lambda(lambda x: x.squeeze().long()),  # Remove channel dim if present, keep as class indices
+    #     ]
+    # )
+
+
+
+    joint_transform = A.Compose([
+        A.Resize(args.resolution, args.resolution, interpolation=1),  # 1 = bilinear
+        A.CenterCrop(args.resolution, args.resolution) if args.center_crop else A.RandomCrop(args.resolution, args.resolution),
+        A.HorizontalFlip(p=0.5) if args.random_flip else A.NoOp(),
+    ], additional_targets={'mask': 'mask'})
 
     def transform_images(examples):
-        images = [augmentations(image.convert("RGB")) for image in examples["image"]]
-        return {"input": images}
+        images = []
+        masks = []
+        for image_path, mask_path in zip(examples["image"], examples["mask"]):
+            image = np.array(Image.open(image_path).convert("RGB"))
+            mask = np.load(mask_path)  # shape: (C, H, W)
+            mask = np.transpose(mask, (1, 2, 0))  # shape: (H, W, C)
+            augmented = joint_transform(image=image, mask=mask)
+            img = transforms.ToTensor()(augmented["image"])
+            img = transforms.Normalize([0.5], [0.5])(img)
+            msk = torch.from_numpy(np.transpose(augmented["mask"], (2, 0, 1))).long()
+            masks.append(msk)
+            images.append(img)
+        return {"input": images, "seg_mask": masks}
+
+    # def transform_images(examples):
+    #     images = [augmentations(image.convert("RGB")) for image in examples["image"]]
+    #     return {"input": images}
+
+    # def transform_images(examples):
+    #     images = [augmentations(Image.open(image_path).convert("RGB")) for image_path in examples["image"]]
+    #     masks = [mask_augmentations(Image.open(mask_path)) for mask_path in examples["mask"]]
+    #     return {"input": images, "seg_mask": masks}
 
     logger.info(f"Dataset size: {len(dataset)}")
 
@@ -565,8 +632,11 @@ def main(args):
                 continue
 
             clean_images = batch["input"].to(weight_dtype)
-            latents = vae.encode(clean_images).latents
-            latents = latents * 0.18215#vae.config.scaling_factor
+            # latents = vae.encode(clean_images).latents
+            # latents = latents * 0.18215#vae.config.scaling_factor
+
+            latents = vae.encode(clean_images).latent_dist.sample()
+            latents = latents * vae.config.scaling_factor
 
             # Sample noise that we'll add to the images
             noise = torch.randn(latents.shape, dtype=weight_dtype, device=latents.device)
@@ -582,17 +652,27 @@ def main(args):
 
             with accelerator.accumulate(model):
                 # Predict the noise residual
-                model_output = model(noisy_latents, timesteps).sample
+                image_out, seg_out = model(noisy_latents, timesteps)
+                # image_out = model_output.sample
+                # seg_out = model_output.mask
+                seg_gt = batch["seg_mask"].to(seg_out.device).float()
 
                 if args.prediction_type == "epsilon":
-                    loss = F.mse_loss(model_output.float(), noise.float())  # this could have different weights!
+                    diffusion_loss = F.mse_loss(image_out.float(), noise.float())  # this could have different weights!
+
+                    if seg_out.shape[-2:] != seg_gt.shape[-2:]:
+                        seg_out = F.interpolate(seg_out, size=seg_gt.shape[-2:], mode="bilinear", align_corners=False)
+
+                    seg_loss = dice_loss(seg_out, seg_gt)
+                    loss = diffusion_loss + seg_loss
+                
                 elif args.prediction_type == "sample":
                     alpha_t = _extract_into_tensor(
                         noise_scheduler.alphas_cumprod, timesteps, (clean_images.shape[0], 1, 1, 1)
                     )
                     snr_weights = alpha_t / (1 - alpha_t)
                     # use SNR weighting from distillation paper
-                    loss = snr_weights * F.mse_loss(model_output.float(), clean_images.float(), reduction="none")
+                    loss = snr_weights * F.mse_loss(image_out.float(), clean_images.float(), reduction="none")
                     loss = loss.mean()
                 else:
                     raise ValueError(f"Unsupported prediction type: {args.prediction_type}")
@@ -638,7 +718,10 @@ def main(args):
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "step": global_step}
+            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], 
+                    "diffusion_loss": diffusion_loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0],
+                    "seg_loss": seg_loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0],
+                    "step": global_step}
             if args.use_ema:
                 logs["ema_decay"] = ema_model.cur_decay_value
             progress_bar.set_postfix(**logs)
@@ -664,12 +747,12 @@ def main(args):
 
                 generator = torch.Generator(device=pipeline.device).manual_seed(0)
                 # run pipeline in inference (sample random noise and denoise)
-                images = pipeline(
+                images, masks = pipeline(
                     generator=generator,
                     batch_size=args.eval_batch_size,
                     num_inference_steps=args.ddpm_num_inference_steps,
                     output_type="numpy",
-                ).images
+                )
 
                 if args.use_ema:
                     ema_model.restore(unet.parameters())
@@ -683,6 +766,35 @@ def main(args):
                     else:
                         tracker = accelerator.get_tracker("tensorboard")
                     tracker.add_images("test_samples", images_processed.transpose(0, 3, 1, 2), epoch)
+
+                    # --- post-process mask prediction ---
+                    # Step 1: softmax across class dimension
+                    probs = F.softmax(masks, dim=1)  # [B, 3, H, W]
+
+                    # Step 2: argmax to get predicted class indices
+                    pred_classes = torch.argmax(probs, dim=1)  # [B, H, W]
+
+                    # Step 3: apply coloring
+                    # Mapping: 0=lane (red), 1=drivable (green), 2=background (black)
+                    color_map = {
+                        0: [255, 0, 0],   # red
+                        1: [0, 255, 0],   # green
+                        2: [0, 0, 0],     # black
+                    }
+
+                    # Create a color image for each predicted mask
+                    colored_masks = []
+                    for mask in pred_classes.cpu().numpy():  # shape [H, W]
+                        color_mask = np.zeros((mask.shape[0], mask.shape[1], 3), dtype=np.uint8)
+                        for class_idx, color in color_map.items():
+                            color_mask[mask == class_idx] = color
+                        colored_masks.append(color_mask)
+
+                    colored_masks = np.stack(colored_masks)  # shape [B, H, W, 3]
+
+                    # Log to TensorBoard
+                    tracker.add_images("predicted_masks", colored_masks.transpose(0, 3, 1, 2), epoch)
+
                 elif args.logger == "wandb":
                     # Upcoming `log_images` helper coming in https://github.com/huggingface/accelerate/pull/962/files
                     accelerator.get_tracker("wandb").log(
