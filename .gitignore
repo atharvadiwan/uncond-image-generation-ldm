@@ -9,3 +9,4 @@ src/diffusers.egg-info/
 __pycache__
 temp.png
 asv_256_exp1/
+train_log.txt
